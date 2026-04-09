@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QT9 Download Progress</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f4f6f9;
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 40px 24px;
+    }
+    .card {
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 2px 12px rgba(0,0,0,.1);
+      padding: 36px 40px;
+      width: 100%;
+      max-width: 600px;
+    }
+    h1 { font-size: 1.35rem; font-weight: 700; margin: 0 0 4px; color: #1a1a2e; }
+    #status-bar {
+      font-size: 0.85rem;
+      color: #666;
+      margin-bottom: 24px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .spinner {
+      width: 14px; height: 14px;
+      border: 2px solid #d0d5dd;
+      border-top-color: #1a6ef5;
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner.hidden { display: none; }
+
+    /* Result rows */
+    #results { margin-bottom: 20px; }
+    .doc-row {
+      display: flex;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 10px 0;
+      border-bottom: 1px solid #f0f0f0;
+    }
+    .doc-row:last-child { border-bottom: none; }
+    .ref {
+      font-family: monospace;
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: #1a1a2e;
+      min-width: 130px;
+    }
+    .badge {
+      font-size: 0.78rem;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+    .badge-pending   { background: #f0f0f0; color: #888; }
+    .badge-downloading { background: #fff4e0; color: #b36b00; }
+    .badge-found     { background: #e6f4ea; color: #1e7e34; }
+    .badge-no_file   { background: #fff3cd; color: #856404; }
+    .badge-not_found { background: #fde8e8; color: #c0392b; }
+
+    .files { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+    .files a {
+      font-size: 0.8rem;
+      color: #1a6ef5;
+      text-decoration: none;
+      border: 1px solid #d0d5dd;
+      border-radius: 4px;
+      padding: 2px 8px;
+    }
+    .files a:hover { background: #f0f5ff; }
+
+    /* ZIP button */
+    #zip-area { margin-top: 4px; margin-bottom: 20px; }
+    #zip-btn {
+      display: inline-block;
+      background: #1e7e34;
+      color: #fff;
+      text-decoration: none;
+      padding: 10px 22px;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+    #zip-btn:hover { background: #186429; }
+
+    /* Log */
+    details { margin-top: 20px; }
+    summary {
+      font-size: 0.82rem;
+      color: #888;
+      cursor: pointer;
+      user-select: none;
+    }
+    #log {
+      margin-top: 8px;
+      background: #f7f8fa;
+      border-radius: 6px;
+      padding: 12px 14px;
+      font-size: 0.78rem;
+      font-family: monospace;
+      max-height: 180px;
+      overflow-y: auto;
+      line-height: 1.6;
+      color: #444;
+    }
+
+    .back { display: inline-block; margin-top: 20px; font-size: 0.82rem; color: #888; text-decoration: none; }
+    .back:hover { color: #333; }
+
+    .error-msg { color: #c0392b; font-size: 0.88rem; margin-bottom: 12px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Download Progress</h1>
+    <div id="status-bar">
+      <div class="spinner" id="spinner"></div>
+      <span id="status-text">Starting…</span>
+    </div>
+
+    <div id="error-area"></div>
+    <div id="results"></div>
+    <div id="zip-area"></div>
+
+    <details>
+      <summary>Show log</summary>
+      <div id="log"></div>
+    </details>
+
+    <a href="/" class="back">← Start a new download</a>
+  </div>
+
+  <script>
+    const JOB_ID = {{ job_id | tojson }};
+
+    const LABELS = {
+      pending:     { text: '⏳ Pending',             cls: 'badge-pending' },
+      downloading: { text: '⬇ Downloading…',        cls: 'badge-downloading' },
+      found:       { text: '✔ Downloaded',           cls: 'badge-found' },
+      no_file:     { text: '⚠ Found (no file stored)', cls: 'badge-no_file' },
+      not_found:   { text: '✘ Not found',            cls: 'badge-not_found' },
+    };
+
+    function render(data) {
+      // Status bar
+      const spinner = document.getElementById('spinner');
+      const statusText = document.getElementById('status-text');
+      if (data.status === 'running') {
+        spinner.classList.remove('hidden');
+        statusText.textContent = 'Working…';
+      } else if (data.status === 'done') {
+        spinner.classList.add('hidden');
+        statusText.textContent = 'Complete.';
+      } else if (data.status === 'error') {
+        spinner.classList.add('hidden');
+        statusText.textContent = 'Error.';
+      }
+
+      // Error message
+      const errorArea = document.getElementById('error-area');
+      if (data.error) {
+        errorArea.innerHTML = `<div class="error-msg">${escHtml(data.error)}</div>`;
+      }
+
+      // Result rows
+      const resultsEl = document.getElementById('results');
+      resultsEl.innerHTML = '';
+      for (const ref of (data.doc_refs || [])) {
+        const r = data.results[ref] || {};
+        const lbl = LABELS[r.status] || { text: r.status, cls: '' };
+        const links = (r.files || []).map(f =>
+          `<a href="/files/${JOB_ID}/${encodeURIComponent(f)}" download>${escHtml(f)}</a>`
+        ).join('');
+
+        const div = document.createElement('div');
+        div.className = 'doc-row';
+        div.innerHTML =
+          `<span class="ref">${escHtml(ref)}</span>` +
+          `<span class="badge ${lbl.cls}">${lbl.text}</span>` +
+          (links ? `<span class="files">${links}</span>` : '');
+        resultsEl.appendChild(div);
+      }
+
+      // ZIP button — show when done and at least one file exists
+      const zipArea = document.getElementById('zip-area');
+      const hasFiles = (data.doc_refs || []).some(
+        ref => (data.results[ref]?.files || []).length > 0
+      );
+      if (data.status === 'done' && hasFiles) {
+        zipArea.innerHTML =
+          `<a id="zip-btn" href="/zip/${JOB_ID}">Download All as ZIP</a>`;
+      }
+
+      // Log
+      const logEl = document.getElementById('log');
+      const wasAtBottom = logEl.scrollHeight - logEl.clientHeight <= logEl.scrollTop + 4;
+      logEl.innerHTML = (data.messages || []).map(m => escHtml(m)).join('<br>');
+      if (wasAtBottom) logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function escHtml(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function poll() {
+      fetch(`/api/job/${JOB_ID}`)
+        .then(r => r.json())
+        .then(data => {
+          render(data);
+          if (data.status === 'running') {
+            setTimeout(poll, 1500);
+          }
+        })
+        .catch(() => setTimeout(poll, 3000));
+    }
+
+    poll();
+  </script>
+</body>
+</html>
