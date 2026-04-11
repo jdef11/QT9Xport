@@ -20,14 +20,17 @@ Options:
 import argparse
 import getpass
 import logging
+import mimetypes
 import random
 import re
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 
@@ -86,6 +89,8 @@ def parse_args():
     parser.add_argument("--name-prefix", default="QMS,SDS", dest="name_prefix",
                         help="Comma-separated prefixes — only download docs whose name starts with "
                              "one of these (default: QMS,SDS). Set to empty string to download all.")
+    parser.add_argument("--workers", type=int, default=5,
+                        help="Parallel HTTP download workers (default: 5)")
     return parser.parse_args()
 
 
@@ -673,6 +678,267 @@ def download_row(page, row, doc_name: str, output_dir: Path,
         return False
 
 
+def get_row_doc_id(row) -> str:
+    """Read the numeric doc ID from TD[1] (display:none hidden cell)."""
+    try:
+        cells = row.query_selector_all("td")
+        if len(cells) > 1:
+            return cells[1].inner_text().strip()
+    except Exception:
+        pass
+    return ""
+
+
+def probe_download_url(page, row, timeout_ms: int) -> str | None:
+    """
+    Open the context menu on `row` and return the download URL string.
+    Case A: href is a real URL — return it directly.
+    Case B: href is JS or missing — trigger one real download, read its URL, cancel it.
+    Returns None if "Download File" is not visible (electronic doc) or on error.
+    """
+    try:
+        row.click(button="right", timeout=5000)
+        page.wait_for_selector(
+            '#ctl00_cphCenter_rcmCurrentDocsGridRow_detached',
+            state='visible',
+            timeout=5000,
+        )
+        dl_link = page.query_selector(
+            '#ctl00_cphCenter_rcmCurrentDocsGridRow_detached '
+            'a.rmLink:has-text("Download File")'
+        )
+        if not dl_link or not dl_link.is_visible():
+            page.keyboard.press("Escape")
+            return None
+
+        # Case A: direct href on the anchor
+        href = dl_link.get_attribute("href") or ""
+        if href and not href.startswith("javascript"):
+            page.keyboard.press("Escape")
+            return href
+
+        # Case B: JS-triggered — fire one real download just to capture its URL
+        with page.expect_download(timeout=timeout_ms) as dl_info:
+            dl_link.click(timeout=5000)
+        download = dl_info.value
+        url = download.url
+        download.cancel()
+        return url
+
+    except Exception as e:
+        log.debug(f"probe_download_url: {e}")
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return None
+
+
+def _derive_url_template(raw_url: str, doc_id: str) -> str | None:
+    """
+    Replace the numeric doc ID value in `raw_url` with a `{doc_id}` placeholder.
+    Returns None if the ID cannot be located in the URL.
+    """
+    if not doc_id or not raw_url:
+        return None
+    escaped = re.escape(doc_id)
+    # Try DocID= parameter first (most likely)
+    template = re.sub(rf'(DocID=){escaped}', r'\1{doc_id}', raw_url, flags=re.IGNORECASE)
+    if '{doc_id}' not in template:
+        # Generic: any query-string value equal to the numeric ID
+        template = re.sub(rf'(=){escaped}(\b|&|$)', r'\1{doc_id}\2', raw_url)
+    if '{doc_id}' not in template:
+        log.warning(f"Could not find doc_id '{doc_id}' in URL '{raw_url}'")
+        return None
+    return template
+
+
+def _ext_from_response(resp) -> str:
+    """Derive file extension from Content-Disposition or Content-Type header."""
+    cd = resp.headers.get("Content-Disposition", "")
+    m = re.search(r'filename=["\']?([^"\';\s]+)', cd, re.IGNORECASE)
+    if m:
+        ext = Path(m.group(1).strip()).suffix
+        if ext:
+            return ext
+
+    ct = resp.headers.get("Content-Type", "").split(";")[0].strip()
+    if ct == "application/pdf":
+        return ".pdf"
+    ext = mimetypes.guess_extension(ct) or ""
+    return ext
+
+
+def scan_all_documents(page, prefixes: list, output_dir: Path,
+                       timeout_ms: int, shots_dir: Path) -> tuple[list[dict], str | None]:
+    """
+    Scan all grid pages and collect document metadata without downloading anything.
+    Probes the download URL template from the first eligible row that isn't already on disk.
+    Returns (docs_list, url_template).
+    Each doc dict: {doc_name, doc_id, exists, existing_path}.
+    """
+    docs = []
+    url_template = None
+    page_num = 1
+
+    while True:
+        rows = get_grid_rows(page)
+        log.info(f"--- Scan page {page_num}: {len(rows)} rows ---")
+        if page_num == 1:
+            screenshot(page, f"scan_page_{page_num:03d}", shots_dir)
+        if not rows:
+            break
+
+        for row in rows:
+            doc_name = get_row_doc_name(row)
+
+            if prefixes and not any(doc_name.startswith(p) for p in prefixes):
+                continue
+
+            doc_id = get_row_doc_id(row)
+            safe_name = sanitize_filename(doc_name)
+            existing = list(output_dir.glob(f"{safe_name}.*"))
+
+            # Probe URL from first eligible row that hasn't been downloaded yet
+            if url_template is None and not existing and doc_id:
+                raw = probe_download_url(page, row, timeout_ms)
+                if raw:
+                    url_template = _derive_url_template(raw, doc_id)
+                    if url_template:
+                        log.info(f"Download URL template: {url_template}")
+                    else:
+                        log.warning(f"Could not derive URL template from: {raw}")
+                else:
+                    log.debug(f"probe_download_url returned None for '{doc_name}' (electronic doc?)")
+
+            docs.append({
+                "doc_name": doc_name,
+                "doc_id": doc_id,
+                "exists": bool(existing),
+                "existing_path": existing[0] if existing else None,
+            })
+
+        if not next_page(page, timeout_ms):
+            break
+        page_num += 1
+
+    return docs, url_template
+
+
+def build_session(context) -> requests.Session:
+    """Seed a requests.Session with the Playwright browser context's cookies."""
+    session = requests.Session()
+    for c in context.cookies():
+        session.cookies.set(
+            c["name"], c["value"],
+            domain=c.get("domain", ""),
+            path=c.get("path", "/"),
+        )
+    return session
+
+
+def download_via_http(session, url: str, doc_name: str,
+                      output_dir: Path) -> tuple[Path | None, str]:
+    """
+    Download one document via HTTP (no browser).
+    Returns (Path, reason): reason is "ok" | "exists" | "no_file" | "error".
+    """
+    safe_name = sanitize_filename(doc_name)
+    existing = list(output_dir.glob(f"{safe_name}.*"))
+    if existing:
+        return existing[0], "exists"
+
+    try:
+        resp = session.get(url, stream=True, timeout=60)
+        if resp.status_code == 404:
+            return None, "no_file"
+        resp.raise_for_status()
+
+        ext = _ext_from_response(resp) or ".bin"
+        filepath = output_dir / f"{safe_name}{ext}"
+        counter = 1
+        while filepath.exists():
+            filepath = output_dir / f"{safe_name}_{counter}{ext}"
+            counter += 1
+
+        with open(filepath, "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=65536):
+                fh.write(chunk)
+
+        return filepath, "ok"
+
+    except Exception as e:
+        log.warning(f"HTTP download failed for '{doc_name}': {e}")
+        return None, "error"
+
+
+def _run_sequential_fallback(base_url: str, docs_url: str, username: str, password: str,
+                              prefixes: list, output_dir: Path, shots_dir: Path,
+                              timeout_ms: int, args) -> None:
+    """
+    Sequential Playwright fallback used when the HTTP URL template cannot be determined.
+    Mirrors the original main() download loop.
+    """
+    log.info("Running sequential Playwright fallback…")
+    total_success = total_fail = 0
+
+    with tempfile.TemporaryDirectory(prefix="qt9_tmp_") as tmp_dir, \
+            sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=not args.headed,
+            downloads_path=tmp_dir,
+        )
+        context = browser.new_context(
+            accept_downloads=True,
+            viewport={"width": 1400, "height": 900},
+        )
+        page = context.new_page()
+
+        if not login(page, base_url, username, password, timeout_ms, shots_dir):
+            log.error("Login failed in fallback — aborting.")
+            browser.close()
+            return
+
+        page.goto(docs_url, timeout=timeout_ms)
+        page.wait_for_load_state("networkidle", timeout=timeout_ms)
+
+        apply_status_filter(page, args.status_filter, timeout_ms, shots_dir)
+        set_max_page_size(page, timeout_ms, shots_dir)
+        apply_name_filter(page, prefixes, timeout_ms, shots_dir)
+
+        page_num = 1
+        while True:
+            rows = get_grid_rows(page)
+            log.info(f"--- Grid page {page_num}: {len(rows)} rows ---")
+            if not rows:
+                break
+
+            i = 0
+            while i < len(rows):
+                doc_name = get_row_doc_name(rows[i])
+                if prefixes and not any(doc_name.startswith(p) for p in prefixes):
+                    i += 1
+                    continue
+                if download_row(page, rows[i], doc_name, output_dir, timeout_ms, shots_dir):
+                    total_success += 1
+                else:
+                    total_fail += 1
+                    rows = get_grid_rows(page)
+                    if i >= len(rows):
+                        break
+                    continue
+                i += 1
+
+            if not next_page(page, timeout_ms):
+                break
+            page_num += 1
+
+        browser.close()
+
+    log.info(f"Fallback done — Downloaded: {total_success}  |  Failed: {total_fail}")
+    spot_check_downloads(output_dir)
+
+
 def main():
     args = parse_args()
     base_url = args.url.rstrip("/")
@@ -687,13 +953,15 @@ def main():
 
     username, password = prompt_credentials()
 
+    prefixes = [p.strip() for p in args.name_prefix.split(",") if p.strip()]
+
     log.info("=" * 60)
     log.info("QT9 QMS Bulk Document Downloader")
     log.info(f"Source  : {docs_url}")
     log.info(f"Output  : {output_dir.resolve()}")
     log.info(f"Filter  : {args.status_filter}")
-    prefixes = [p.strip() for p in args.name_prefix.split(",") if p.strip()]
     log.info(f"Prefixes: {', '.join(prefixes) if prefixes else '(none — all docs)'}")
+    log.info(f"Workers : {args.workers}")
     log.info(f"Log     : {log_file}")
     log.info(f"Shots   : {shots_dir}")
     log.info("=" * 60)
@@ -701,6 +969,9 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     shots_dir.mkdir(parents=True, exist_ok=True)
 
+    # ------------------------------------------------------------------
+    # Phase 1 — Playwright: login, scan all pages, probe download URL
+    # ------------------------------------------------------------------
     with tempfile.TemporaryDirectory(prefix="qt9_tmp_") as tmp_dir, \
             sync_playwright() as p:
         browser = p.chromium.launch(
@@ -713,13 +984,11 @@ def main():
         )
         page = context.new_page()
 
-        # Login
         if not login(page, base_url, username, password, timeout_ms, shots_dir):
             log.error("Login failed — aborting.")
             browser.close()
             sys.exit(1)
 
-        # Navigate to Current Documents
         log.info(f"Navigating to documents page: {docs_url}")
         page.goto(docs_url, timeout=timeout_ms)
         page.wait_for_load_state("networkidle", timeout=timeout_ms)
@@ -729,57 +998,70 @@ def main():
         set_max_page_size(page, timeout_ms, shots_dir)
         apply_name_filter(page, prefixes, timeout_ms, shots_dir)
 
-        total_success = 0
-        total_fail = 0
-        page_num = 1
-
-        while True:
-            rows = get_grid_rows(page)
-            log.info(f"--- Grid page {page_num}: {len(rows)} rows ---")
-            if page_num == 1:
-                screenshot(page, f"grid_page_{page_num:03d}", shots_dir)
-
-            if not rows:
-                log.warning("No rows found on this page — stopping.")
-                break
-
-            i = 0
-            while i < len(rows):
-                row = rows[i]
-                doc_name = get_row_doc_name(row)
-                log.info(f"[{i+1}/{len(rows)}] {doc_name}")
-
-                if prefixes and not any(doc_name.startswith(p) for p in prefixes):
-                    log.info(f"SKIP (no matching prefix {prefixes}): {doc_name}")
-                    i += 1
-                    continue
-
-                if download_row(page, row, doc_name, output_dir, timeout_ms, shots_dir):
-                    total_success += 1
-                else:
-                    total_fail += 1
-                    # Re-fetch only after a failure in case the DOM shifted
-                    rows = get_grid_rows(page)
-                    if i >= len(rows):
-                        log.warning(f"Row {i+1} disappeared after failed download — stopping page")
-                        break
-                    continue  # retry same index with fresh row reference
-
-                i += 1
-
-            if not next_page(page, timeout_ms):
-                break
-            page_num += 1
-
-        log.info("=" * 60)
-        log.info(f"DONE — Downloaded: {total_success}  |  Failed: {total_fail}")
-        log.info(f"Files : {output_dir.resolve()}")
-        log.info(f"Log   : {log_file}")
-        log.info("=" * 60)
-
-        spot_check_downloads(output_dir)
-
+        log.info("Phase 1: scanning all documents…")
+        docs, url_template = scan_all_documents(
+            page, prefixes, output_dir, timeout_ms, shots_dir
+        )
+        auth_session = build_session(context)
         browser.close()
+
+    log.info(f"Phase 1 complete: {len(docs)} document(s) found")
+
+    # ------------------------------------------------------------------
+    # Phase 2 — HTTP: parallel downloads (no browser)
+    # ------------------------------------------------------------------
+    if not url_template:
+        log.warning("Could not determine download URL template — falling back to sequential Playwright mode")
+        _run_sequential_fallback(
+            base_url, docs_url, username, password,
+            prefixes, output_dir, shots_dir, timeout_ms, args,
+        )
+        return
+
+    to_download = [d for d in docs if not d["exists"] and d["doc_id"]]
+    total_skip = sum(1 for d in docs if d["exists"])
+    log.info(f"Phase 2: {len(to_download)} to download, {total_skip} already on disk")
+
+    total_success = total_fail = 0
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        future_to_doc = {
+            pool.submit(
+                download_via_http,
+                auth_session,
+                url_template.format(doc_id=d["doc_id"]),
+                d["doc_name"],
+                output_dir,
+            ): d
+            for d in to_download
+        }
+
+        for future in as_completed(future_to_doc):
+            doc = future_to_doc[future]
+            try:
+                path, reason = future.result()
+            except Exception as exc:
+                log.error(f"Unexpected error for '{doc['doc_name']}': {exc}")
+                total_fail += 1
+                continue
+
+            if reason in ("ok", "exists"):
+                total_success += 1
+                log.info(f"DOWNLOADED: {Path(path).name}")
+            elif reason == "no_file":
+                total_success += 1
+                log.info(f"SKIP (no file): {doc['doc_name']}")
+            else:
+                total_fail += 1
+                log.warning(f"FAILED: {doc['doc_name']}")
+
+    log.info("=" * 60)
+    log.info(f"DONE — Downloaded: {total_success}  |  Failed: {total_fail}  |  Skipped: {total_skip}")
+    log.info(f"Files : {output_dir.resolve()}")
+    log.info(f"Log   : {log_file}")
+    log.info("=" * 60)
+
+    spot_check_downloads(output_dir)
 
 
 if __name__ == "__main__":

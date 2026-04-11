@@ -8,13 +8,12 @@ import io
 import re
 import tempfile
 import threading
-import time
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, redirect, render_template, request, send_file
-from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
 from qt9_downloader import (
@@ -22,11 +21,11 @@ from qt9_downloader import (
     DOCS_PAGE,
     apply_name_filter,
     apply_status_filter,
-    get_grid_rows,
-    get_row_doc_name,
+    build_session,
+    download_via_http,
     login,
-    next_page,
     sanitize_filename,
+    scan_all_documents,
     screenshot,
     set_max_page_size,
     spot_check_downloads,
@@ -36,6 +35,7 @@ app = Flask(__name__)
 
 DOWNLOADS_DIR = Path("./qt9_downloads/web")
 TIMEOUT_MS = 30_000
+DOWNLOAD_WORKERS = 5
 
 # In-memory job store — keyed by job_id (UUID string)
 # {job_id: {status, doc_refs, results, messages, error}}
@@ -43,80 +43,7 @@ JOBS: dict = {}
 
 
 # ---------------------------------------------------------------------------
-# Core download helper — like qt9_downloader.download_row but returns the
-# saved filepath (or None) so the web layer can track what was downloaded.
-# ---------------------------------------------------------------------------
-
-def _download_file(page, row, doc_name: str, output_dir: Path, shots_dir: Path):
-    """
-    Right-click a grid row and save the file.
-    Returns:
-        (Path, "ok")       — file saved successfully
-        (Path, "exists")   — file already present in output_dir
-        (None, "no_file")  — document has no file stored in QT9
-        (None, "error")    — timeout or other failure
-    """
-    safe_name = sanitize_filename(doc_name)
-
-    existing = list(output_dir.glob(f"{safe_name}.*"))
-    if existing:
-        return (existing[0], "exists")
-
-    try:
-        row.click(button="right", timeout=5000)
-
-        try:
-            page.wait_for_selector(
-                "#ctl00_cphCenter_rcmCurrentDocsGridRow_detached",
-                state="visible",
-                timeout=5000,
-            )
-        except PlaywrightTimeout:
-            try:
-                page.keyboard.press("Escape")
-            except Exception:
-                pass
-            return (None, "error")
-
-        dl_link = page.query_selector(
-            '#ctl00_cphCenter_rcmCurrentDocsGridRow_detached '
-            'a.rmLink:has-text("Download File")'
-        )
-        if not dl_link or not dl_link.is_visible():
-            page.keyboard.press("Escape")
-            return (None, "no_file")
-
-        with page.expect_download(timeout=TIMEOUT_MS) as dl_info:
-            dl_link.click(timeout=5000)
-
-        download = dl_info.value
-        ext = Path(download.suggested_filename or f"{safe_name}.bin").suffix
-
-        filepath = output_dir / f"{safe_name}{ext}"
-        counter = 1
-        while filepath.exists():
-            filepath = output_dir / f"{safe_name}_{counter}{ext}"
-            counter += 1
-
-        download.save_as(str(filepath))
-        return (filepath, "ok")
-
-    except PlaywrightTimeout:
-        try:
-            page.keyboard.press("Escape")
-        except Exception:
-            pass
-        return (None, "error")
-    except Exception:
-        try:
-            page.keyboard.press("Escape")
-        except Exception:
-            pass
-        return (None, "error")
-
-
-# ---------------------------------------------------------------------------
-# Background job runner
+# Background job runner (two-phase: Playwright scan → parallel HTTP downloads)
 # ---------------------------------------------------------------------------
 
 def run_download_job(job_id: str, username: str, password: str, doc_refs: list[str]):
@@ -126,10 +53,16 @@ def run_download_job(job_id: str, username: str, password: str, doc_refs: list[s
     output_dir.mkdir(parents=True, exist_ok=True)
     shots_dir.mkdir(parents=True, exist_ok=True)
 
+    _lock = threading.Lock()
+
     def push(msg: str):
-        job["messages"].append(msg)
+        with _lock:
+            job["messages"].append(msg)
 
     try:
+        # ------------------------------------------------------------------
+        # Phase 1 — Playwright: login, scan, probe URL template, grab cookies
+        # ------------------------------------------------------------------
         with tempfile.TemporaryDirectory(prefix="qt9_tmp_") as tmp_dir, \
                 sync_playwright() as p:
             browser = p.chromium.launch(headless=True, downloads_path=tmp_dir)
@@ -153,71 +86,89 @@ def run_download_job(job_id: str, username: str, password: str, doc_refs: list[s
             set_max_page_size(page, TIMEOUT_MS, shots_dir)
             apply_name_filter(page, doc_refs, TIMEOUT_MS, shots_dir)
 
-            # Track which refs still need to be found (case-insensitive)
-            remaining = set(r.lower() for r in doc_refs)
-            page_num = 1
-
-            while True:
-                push(f"Scanning page {page_num}…")
-                rows = get_grid_rows(page)
-                if not rows:
-                    break
-
-                i = 0
-                while i < len(rows):
-                    doc_name = get_row_doc_name(rows[i])
-
-                    matched_ref = None
-                    for ref in doc_refs:
-                        if doc_name.lower().startswith(ref.lower()):
-                            matched_ref = ref
-                            break
-
-                    if not matched_ref:
-                        i += 1
-                        continue
-
-                    push(f"Found: {doc_name} — downloading…")
-                    job["results"][matched_ref]["status"] = "downloading"
-
-                    filepath, reason = _download_file(
-                        page, rows[i], doc_name, output_dir, shots_dir
-                    )
-
-                    if reason in ("ok", "exists"):
-                        job["results"][matched_ref]["status"] = "found"
-                        job["results"][matched_ref]["files"].append(filepath.name)
-                        remaining.discard(matched_ref.lower())
-                        push(f"Saved: {filepath.name}")
-                    elif reason == "no_file":
-                        job["results"][matched_ref]["status"] = "no_file"
-                        remaining.discard(matched_ref.lower())
-                        push(f"No file stored in QT9 for: {doc_name}")
-                    else:
-                        push(f"Download failed for: {doc_name}")
-                        # Re-fetch only after a failure in case the DOM shifted
-                        rows = get_grid_rows(page)
-                        if i >= len(rows):
-                            push(f"Row {i} disappeared after failed download — stopping page scan")
-                            break
-                        continue  # retry same index with fresh row reference
-
-                    i += 1
-
-                if not remaining:
-                    push("All documents processed.")
-                    break
-
-                if not next_page(page, TIMEOUT_MS):
-                    break
-                page_num += 1
-
+            push("Scanning document list…")
+            docs, url_template = scan_all_documents(
+                page, doc_refs, output_dir, TIMEOUT_MS, shots_dir
+            )
+            auth_session = build_session(context)
             browser.close()
 
-        # Any ref still pending/downloading after full scan was not found
-        for ref in doc_refs:
-            if job["results"][ref]["status"] in ("pending", "downloading"):
-                job["results"][ref]["status"] = "not_found"
+        push(f"Scan complete: {len(docs)} document(s) found")
+
+        # ------------------------------------------------------------------
+        # Phase 2 — HTTP: parallel downloads, updating job results
+        # ------------------------------------------------------------------
+        if not url_template:
+            job["status"] = "error"
+            job["error"] = "Could not determine download URL — all matched docs may be electronic-only."
+            push("ERROR: Could not determine download URL template.")
+            return
+
+        # Match scanned docs back to the requested refs
+        to_download = []
+        for doc in docs:
+            doc_name = doc["doc_name"]
+            matched_ref = None
+            for ref in doc_refs:
+                if doc_name.lower().startswith(ref.lower()):
+                    matched_ref = ref
+                    break
+            if matched_ref is None:
+                continue
+
+            if doc["exists"]:
+                with _lock:
+                    job["results"][matched_ref]["status"] = "found"
+                    job["results"][matched_ref]["files"].append(doc["existing_path"].name)
+                push(f"Already on disk: {doc['existing_path'].name}")
+            elif doc["doc_id"]:
+                to_download.append((doc, matched_ref))
+            else:
+                push(f"No doc ID for: {doc_name} — skipping")
+
+        push(f"Downloading {len(to_download)} file(s) in parallel…")
+
+        def _http_task(doc, matched_ref):
+            url = url_template.format(doc_id=doc["doc_id"])
+            path, reason = download_via_http(auth_session, url, doc["doc_name"], output_dir)
+            return doc, matched_ref, path, reason
+
+        with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+            futures = {
+                pool.submit(_http_task, doc, ref): (doc, ref)
+                for doc, ref in to_download
+            }
+            for future in as_completed(futures):
+                try:
+                    doc, matched_ref, path, reason = future.result()
+                except Exception as exc:
+                    doc, matched_ref = futures[future]
+                    push(f"Unexpected error for '{doc['doc_name']}': {exc}")
+                    with _lock:
+                        job["results"][matched_ref]["status"] = "not_found"
+                    continue
+
+                with _lock:
+                    if reason in ("ok", "exists"):
+                        job["results"][matched_ref]["status"] = "found"
+                        job["results"][matched_ref]["files"].append(path.name)
+                    elif reason == "no_file":
+                        job["results"][matched_ref]["status"] = "no_file"
+                    else:
+                        job["results"][matched_ref]["status"] = "not_found"
+
+                if reason in ("ok", "exists"):
+                    push(f"Saved: {path.name}")
+                elif reason == "no_file":
+                    push(f"No file stored in QT9 for: {doc['doc_name']}")
+                else:
+                    push(f"Download failed for: {doc['doc_name']}")
+
+        # Any ref still pending after the scan was never found in the grid
+        with _lock:
+            for ref in doc_refs:
+                if job["results"][ref]["status"] in ("pending", "downloading"):
+                    job["results"][ref]["status"] = "not_found"
 
         passed = spot_check_downloads(output_dir)
         if not passed:
