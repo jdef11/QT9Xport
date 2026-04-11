@@ -678,6 +678,22 @@ def download_row(page, row, doc_name: str, output_dir: Path,
         return False
 
 
+def _dismiss_context_menu(page):
+    """Press Escape and wait for the Telerik RadContextMenu to fully close."""
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_selector(
+            '#ctl00_cphCenter_rcmCurrentDocsGridRow_detached',
+            state='hidden',
+            timeout=3000,
+        )
+    except Exception:
+        try:
+            page.mouse.click(10, 10)
+        except Exception:
+            pass
+
+
 def get_row_doc_id(row) -> str:
     """Read the numeric doc ID from TD[1] (display:none hidden cell)."""
     try:
@@ -692,9 +708,12 @@ def get_row_doc_id(row) -> str:
 def probe_download_url(page, row, timeout_ms: int) -> str | None:
     """
     Open the context menu on `row` and return the download URL string.
-    Case A: href is a real URL — return it directly.
-    Case B: href is JS or missing — trigger one real download, read its URL, cancel it.
+    Case A: href is a real navigable URL (not "#", not javascript:) — return directly.
+    Case B: href is "#" or JS — trigger one real download, capture its URL, cancel it.
     Returns None if "Download File" is not visible (electronic doc) or on error.
+
+    Note: Telerik RadMenu anchors always have href="#" with JS click handlers,
+    so Case B is the normal path.
     """
     try:
         row.click(button="right", timeout=5000)
@@ -708,29 +727,32 @@ def probe_download_url(page, row, timeout_ms: int) -> str | None:
             'a.rmLink:has-text("Download File")'
         )
         if not dl_link or not dl_link.is_visible():
-            page.keyboard.press("Escape")
+            # Electronic doc — no file stored; close menu and skip
+            _dismiss_context_menu(page)
             return None
 
-        # Case A: direct href on the anchor
+        # Case A: anchor carries a real navigable URL (uncommon with Telerik)
         href = dl_link.get_attribute("href") or ""
-        if href and not href.startswith("javascript"):
-            page.keyboard.press("Escape")
+        if href and href != "#" and not href.startswith("javascript"):
+            _dismiss_context_menu(page)
             return href
 
-        # Case B: JS-triggered — fire one real download just to capture its URL
+        # Case B: "#" or JS — click the item to trigger a real download,
+        # capture the URL from the Download object, then discard the file
+        # (it lands in the auto-cleaned tmp_dir).
         with page.expect_download(timeout=timeout_ms) as dl_info:
             dl_link.click(timeout=5000)
         download = dl_info.value
         url = download.url
-        download.cancel()
+        try:
+            download.cancel()
+        except Exception:
+            pass  # already completed — that's fine, tmp_dir auto-cleans
         return url
 
     except Exception as e:
         log.debug(f"probe_download_url: {e}")
-        try:
-            page.keyboard.press("Escape")
-        except Exception:
-            pass
+        _dismiss_context_menu(page)
         return None
 
 
