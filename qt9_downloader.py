@@ -20,8 +20,10 @@ Options:
 import argparse
 import getpass
 import logging
+import random
 import re
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +36,10 @@ DOCS_PAGE = "/CurrentDocuments.aspx"
 
 # Module-level logger — configured in main()
 log = logging.getLogger("qt9")
+
+# Throttle context-menu screenshots to the first N documents only
+_ctx_screenshot_count = 0
+_CTX_SCREENSHOT_LIMIT = 2
 
 
 def setup_logging(log_dir: Path) -> Path:
@@ -188,9 +194,6 @@ def fill_login_form(page, username: str, password: str, shots_dir: Path) -> bool
         screenshot(page, "03_login_fill_failed", shots_dir)
         return False
 
-    # Brief pause before submit so the page registers the values
-    time.sleep(1)
-
     # Submit — use specific known ID first
     submitted = False
     for sel in [
@@ -243,8 +246,16 @@ def login(page, base_url: str, username: str, password: str,
     page.wait_for_load_state("networkidle", timeout=timeout_ms)
     screenshot(page, "01_login_page", shots_dir)
 
-    log.info("Waiting 5s for fields to enable...")
-    time.sleep(5)
+    log.info("Waiting for login fields to become enabled...")
+    try:
+        page.wait_for_function(
+            "() => { const el = document.querySelector('input[id*=\"txtUserName\"]'); "
+            "return el && !el.disabled; }",
+            timeout=10000,
+        )
+    except PlaywrightTimeout:
+        log.debug("Field-enable wait timed out — falling back to 3s sleep")
+        time.sleep(3)
     screenshot(page, "02_login_fields_ready", shots_dir)
 
     if not fill_login_form(page, username, password, shots_dir):
@@ -294,7 +305,7 @@ def apply_status_filter(page, status_filter: str, timeout_ms: int, shots_dir: Pa
             opts = [o.inner_text().strip() for o in dropdown.query_selector_all("option")]
             log.debug(f"Select options found: {opts}")
             dropdown.select_option(label=status_filter)
-            page.wait_for_load_state("networkidle", timeout=timeout_ms)
+            _wait_for_grid(page, timeout_ms)
             log.info(f"Status filter set to: {status_filter}")
             screenshot(page, "06_filter_applied", shots_dir)
         else:
@@ -305,25 +316,65 @@ def apply_status_filter(page, status_filter: str, timeout_ms: int, shots_dir: Pa
 
 def set_max_page_size(page, timeout_ms: int, shots_dir: Path):
     try:
-        sel = "select.rgPageSizeDD, select[id*='PageSize'], select[id*='pageSize']"
-        select = page.query_selector(sel)
-        if not select:
-            log.debug("Page size dropdown not found")
+        # Try legacy native <select> first (older QT9 versions)
+        select = page.query_selector(
+            "select.rgPageSizeDD, select[id*='PageSize'], select[id*='pageSize']"
+        )
+        if select:
+            options = select.query_selector_all("option")
+            max_val, max_num = None, 0
+            for opt in options:
+                try:
+                    n = int(opt.get_attribute("value") or opt.inner_text())
+                    if n > max_num:
+                        max_num, max_val = n, opt.get_attribute("value") or opt.inner_text()
+                except ValueError:
+                    pass
+            if max_val:
+                select.select_option(max_val)
+                _wait_for_grid(page, timeout_ms)
+                log.info(f"Grid page size set to {max_val} rows (native select)")
+                screenshot(page, "07_page_size_max", shots_dir)
             return
-        options = select.query_selector_all("option")
-        max_val, max_num = None, 0
-        for opt in options:
+
+        # Telerik RadComboBox: click the arrow, find the highest li, click it
+        arrow_btn = page.query_selector(
+            "a[id*='PageSizeComboBox'][id*='Arrow'], "
+            ".RadComboBox[id*='PageSizeComboBox'] .rcbArrowCell"
+        )
+        if not arrow_btn:
+            log.debug("Page size control not found (neither native <select> nor RadComboBox)")
+            return
+
+        arrow_btn.click(timeout=5000)
+        try:
+            page.wait_for_selector(
+                ".RadComboBox[id*='PageSizeComboBox'] .rcbList li",
+                state="visible",
+                timeout=5000,
+            )
+        except PlaywrightTimeout:
+            log.debug("RadComboBox page-size list did not open")
+            return
+
+        items = page.query_selector_all(
+            ".RadComboBox[id*='PageSizeComboBox'] .rcbList li"
+        )
+        max_item, max_num = None, 0
+        for item in items:
             try:
-                n = int(opt.get_attribute("value") or opt.inner_text())
+                n = int(item.inner_text().strip())
                 if n > max_num:
-                    max_num, max_val = n, opt.get_attribute("value") or opt.inner_text()
+                    max_num, max_item = n, item
             except ValueError:
                 pass
-        if max_val:
-            select.select_option(max_val)
-            page.wait_for_load_state("networkidle", timeout=timeout_ms)
-            log.info(f"Grid page size set to {max_val} rows")
+
+        if max_item:
+            max_item.click(timeout=5000)
+            _wait_for_grid(page, timeout_ms)
+            log.info(f"Grid page size set to {max_num} rows (RadComboBox)")
             screenshot(page, "07_page_size_max", shots_dir)
+
     except Exception as e:
         log.debug(f"set_max_page_size: {e}")
 
@@ -394,7 +445,7 @@ def apply_name_filter(page, prefixes: list, timeout_ms: int, shots_dir: Path):
 
         # Submit the filter by pressing Enter in the input
         target.press("Enter")
-        page.wait_for_load_state("networkidle", timeout=timeout_ms)
+        _wait_for_grid(page, timeout_ms)
         log.info(f"Grid name filter applied: starts with '{prefix}'")
         screenshot(page, "08_name_filter_applied", shots_dir)
 
@@ -430,6 +481,70 @@ def get_row_doc_name(row) -> str:
     return "Unknown"
 
 
+def _wait_for_grid(page, timeout_ms: int):
+    """Wait for at least one grid data row after an AJAX filter/page change."""
+    try:
+        page.wait_for_selector(
+            "tr.rgRow, tr.rgAltRow",
+            state="attached",
+            timeout=timeout_ms,
+        )
+    except PlaywrightTimeout:
+        log.debug("_wait_for_grid: timed out waiting for rows — continuing anyway")
+
+
+# Magic byte signatures for common office/PDF formats
+_MAGIC_BYTES: dict[str, bytes] = {
+    ".pdf":  b"%PDF",
+    ".docx": b"PK\x03\x04",
+    ".xlsx": b"PK\x03\x04",
+    ".pptx": b"PK\x03\x04",
+    ".doc":  b"\xd0\xcf\x11\xe0",
+    ".xls":  b"\xd0\xcf\x11\xe0",
+    ".ppt":  b"\xd0\xcf\x11\xe0",
+}
+
+
+def spot_check_downloads(output_dir: Path, sample_size: int = 10) -> bool:
+    """
+    Randomly sample up to `sample_size` downloaded files and verify that
+    each file's leading bytes match the expected magic bytes for its extension.
+    Returns True if all sampled files pass, False if any fail.
+    """
+    all_files = [
+        f for f in output_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in _MAGIC_BYTES
+    ]
+    if not all_files:
+        log.info("spot_check: no recognisable files found — skipping")
+        return True
+
+    sample = random.sample(all_files, min(sample_size, len(all_files)))
+    log.info(f"spot_check: sampling {len(sample)} of {len(all_files)} file(s)")
+
+    passed = True
+    for path in sample:
+        ext = path.suffix.lower()
+        expected = _MAGIC_BYTES[ext]
+        try:
+            header = path.read_bytes()[:len(expected)]
+            ok = header == expected
+        except Exception as e:
+            log.warning(f"  FAIL  {path.name} — read error: {e}")
+            passed = False
+            continue
+        log.info(f"  {'PASS' if ok else 'FAIL'}  {path.name}")
+        if not ok:
+            log.warning(f"         expected {expected!r}, got {header!r}")
+            passed = False
+
+    if passed:
+        log.info("spot_check: all sampled files passed")
+    else:
+        log.warning("spot_check: one or more files FAILED — check logs above")
+    return passed
+
+
 def next_page(page, timeout_ms: int) -> bool:
     for sel in [
         ".rgPageNext:not(.rgPagerButton[disabled])",
@@ -444,8 +559,32 @@ def next_page(page, timeout_ms: int) -> bool:
                 class_val = btn.get_attribute("class") or ""
                 if "disabled" in disabled.lower() or "disabled" in class_val.lower():
                     return False
+
+                # Snapshot the first row's text so we can detect an actual page change.
+                # Telerik marks the last-page button disabled via CSS class rather than
+                # the HTML disabled attribute, so the attribute check above can miss it.
+                # If the grid doesn't change after the click we treat this as the last page.
+                current_rows = page.query_selector_all("tr.rgRow, tr.rgAltRow")
+                first_row_text = current_rows[0].inner_text().strip()[:120] if current_rows else ""
+
                 btn.click(timeout=5000)
-                page.wait_for_load_state("networkidle", timeout=timeout_ms)
+
+                if first_row_text:
+                    try:
+                        page.wait_for_function(
+                            "(text) => { "
+                            "const r = document.querySelectorAll('tr.rgRow, tr.rgAltRow'); "
+                            "return r.length > 0 && r[0].innerText.trim().slice(0, 120) !== text; "
+                            "}",
+                            arg=first_row_text,
+                            timeout=timeout_ms,
+                        )
+                    except PlaywrightTimeout:
+                        log.debug("next_page: first row unchanged after click — treating as last page")
+                        return False
+                else:
+                    _wait_for_grid(page, timeout_ms)
+
                 log.debug("Navigated to next grid page")
                 return True
         except Exception:
@@ -482,8 +621,11 @@ def download_row(page, row, doc_name: str, output_dir: Path,
                 pass
             return False
 
+        global _ctx_screenshot_count
         log.debug("Context menu visible")
-        screenshot(page, f"ctx_menu_{safe_name[:40]}", shots_dir)
+        if _ctx_screenshot_count < _CTX_SCREENSHOT_LIMIT:
+            screenshot(page, f"ctx_menu_{safe_name[:40]}", shots_dir)
+            _ctx_screenshot_count += 1
 
         # Check if "Download File" item is visible — it is hidden by QT9's JS when
         # the document has Electronic==True (no file stored in QT9 to download).
@@ -494,7 +636,6 @@ def download_row(page, row, doc_name: str, output_dir: Path,
         if not dl_link or not dl_link.is_visible():
             log.info(f"SKIP (no downloadable file — Electronic document): {doc_name}")
             page.keyboard.press("Escape")
-            time.sleep(0.3)
             return True  # not a failure
 
         with page.expect_download(timeout=timeout_ms) as dl_info:
@@ -560,9 +701,11 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     shots_dir.mkdir(parents=True, exist_ok=True)
 
-    with sync_playwright() as p:
+    with tempfile.TemporaryDirectory(prefix="qt9_tmp_") as tmp_dir, \
+            sync_playwright() as p:
         browser = p.chromium.launch(
             headless=not args.headed,
+            downloads_path=tmp_dir,
         )
         context = browser.new_context(
             accept_downloads=True,
@@ -593,32 +736,36 @@ def main():
         while True:
             rows = get_grid_rows(page)
             log.info(f"--- Grid page {page_num}: {len(rows)} rows ---")
-            screenshot(page, f"grid_page_{page_num:03d}", shots_dir)
+            if page_num == 1:
+                screenshot(page, f"grid_page_{page_num:03d}", shots_dir)
 
             if not rows:
                 log.warning("No rows found on this page — stopping.")
                 break
 
-            for i, row in enumerate(rows, 1):
+            i = 0
+            while i < len(rows):
+                row = rows[i]
                 doc_name = get_row_doc_name(row)
-                log.info(f"[{i}/{len(rows)}] {doc_name}")
+                log.info(f"[{i+1}/{len(rows)}] {doc_name}")
 
                 if prefixes and not any(doc_name.startswith(p) for p in prefixes):
                     log.info(f"SKIP (no matching prefix {prefixes}): {doc_name}")
+                    i += 1
                     continue
 
-                current_rows = get_grid_rows(page)
-                if i - 1 >= len(current_rows):
-                    log.warning(f"Row {i} disappeared after last download — skipping rest of page")
-                    break
-                target_row = current_rows[i - 1]
-
-                if download_row(page, target_row, doc_name, output_dir, timeout_ms, shots_dir):
+                if download_row(page, row, doc_name, output_dir, timeout_ms, shots_dir):
                     total_success += 1
                 else:
                     total_fail += 1
+                    # Re-fetch only after a failure in case the DOM shifted
+                    rows = get_grid_rows(page)
+                    if i >= len(rows):
+                        log.warning(f"Row {i+1} disappeared after failed download — stopping page")
+                        break
+                    continue  # retry same index with fresh row reference
 
-                time.sleep(0.5)
+                i += 1
 
             if not next_page(page, timeout_ms):
                 break
@@ -629,6 +776,8 @@ def main():
         log.info(f"Files : {output_dir.resolve()}")
         log.info(f"Log   : {log_file}")
         log.info("=" * 60)
+
+        spot_check_downloads(output_dir)
 
         browser.close()
 

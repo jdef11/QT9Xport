@@ -96,5 +96,5 @@ GET /zip/<id>             → builds and streams ZIP of all job files
 - **Grid row layout**: TD[0] and TD[1] are `display:none` (status flags and numeric doc ID). TD[2] (first visible) is `DocumentName`
 - **Context menu**: Telerik `RadContextMenu` ID `ctl00_cphCenter_rcmCurrentDocsGridRow`. After right-click, the `_detached` container becomes visible. Menu items use `a.rmLink`
 - **"Download File" visibility**: QT9's `SetMenuItems()` hides the item when `getDataKeyValue("Electronic") == 'True'` — but JS type coercion means this never fires; hidden = no file stored
-- **Playwright downloads**: Do NOT set `downloads_path` on `browser.launch()` — temp files appear in the output folder. Use `download.save_as()` only
+- **Playwright downloads**: `downloads_path` on `browser.launch()` is set to a `tempfile.TemporaryDirectory` — keeps Playwright staging files out of the output folder. The temp dir is auto-cleaned when the `with` block exits. `download.save_as()` is still used to move each file to its final location.
 - **Page size dropdown**: Telerik `RadComboBox`, not a standard `<select>` — `set_max_page_size()` won't find it; pages default to 50 rows

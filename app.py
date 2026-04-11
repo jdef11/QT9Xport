@@ -6,6 +6,7 @@ Visit: http://localhost:5000
 
 import io
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -19,6 +20,7 @@ from playwright.sync_api import sync_playwright
 from qt9_downloader import (
     BASE_URL,
     DOCS_PAGE,
+    apply_name_filter,
     apply_status_filter,
     get_grid_rows,
     get_row_doc_name,
@@ -27,6 +29,7 @@ from qt9_downloader import (
     sanitize_filename,
     screenshot,
     set_max_page_size,
+    spot_check_downloads,
 )
 
 app = Flask(__name__)
@@ -81,7 +84,6 @@ def _download_file(page, row, doc_name: str, output_dir: Path, shots_dir: Path):
         )
         if not dl_link or not dl_link.is_visible():
             page.keyboard.press("Escape")
-            time.sleep(0.3)
             return (None, "no_file")
 
         with page.expect_download(timeout=TIMEOUT_MS) as dl_info:
@@ -128,8 +130,9 @@ def run_download_job(job_id: str, username: str, password: str, doc_refs: list[s
         job["messages"].append(msg)
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+        with tempfile.TemporaryDirectory(prefix="qt9_tmp_") as tmp_dir, \
+                sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, downloads_path=tmp_dir)
             context = browser.new_context(
                 accept_downloads=True,
                 viewport={"width": 1400, "height": 900},
@@ -148,6 +151,7 @@ def run_download_job(job_id: str, username: str, password: str, doc_refs: list[s
 
             apply_status_filter(page, "All/Any", TIMEOUT_MS, shots_dir)
             set_max_page_size(page, TIMEOUT_MS, shots_dir)
+            apply_name_filter(page, doc_refs, TIMEOUT_MS, shots_dir)
 
             # Track which refs still need to be found (case-insensitive)
             remaining = set(r.lower() for r in doc_refs)
@@ -176,12 +180,6 @@ def run_download_job(job_id: str, username: str, password: str, doc_refs: list[s
                     push(f"Found: {doc_name} — downloading…")
                     job["results"][matched_ref]["status"] = "downloading"
 
-                    # Re-fetch rows in case DOM changed (previous download may shift rows)
-                    rows = get_grid_rows(page)
-                    if i >= len(rows):
-                        push(f"Row disappeared — skipping {doc_name}")
-                        continue
-
                     filepath, reason = _download_file(
                         page, rows[i], doc_name, output_dir, shots_dir
                     )
@@ -197,6 +195,12 @@ def run_download_job(job_id: str, username: str, password: str, doc_refs: list[s
                         push(f"No file stored in QT9 for: {doc_name}")
                     else:
                         push(f"Download failed for: {doc_name}")
+                        # Re-fetch only after a failure in case the DOM shifted
+                        rows = get_grid_rows(page)
+                        if i >= len(rows):
+                            push(f"Row {i} disappeared after failed download — stopping page scan")
+                            break
+                        continue  # retry same index with fresh row reference
 
                     i += 1
 
@@ -214,6 +218,10 @@ def run_download_job(job_id: str, username: str, password: str, doc_refs: list[s
         for ref in doc_refs:
             if job["results"][ref]["status"] in ("pending", "downloading"):
                 job["results"][ref]["status"] = "not_found"
+
+        passed = spot_check_downloads(output_dir)
+        if not passed:
+            push("WARNING: file integrity check found suspicious files — see server logs")
 
         job["status"] = "done"
         push("Complete.")
